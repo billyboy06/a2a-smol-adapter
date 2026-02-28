@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "a2a-smol-adapter"
+version = "0.1.0"
+description = "Bridge between smolagents and the A2A (Agent2Agent) protocol"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Matthieu", email = "matthieu@fripp.fr" },
+]
+keywords = ["a2a", "agent2agent", "smolagents", "multi-agent", "interoperability"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "a2a-sdk[http-server]",
+    "smolagents",
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-httpx",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/matthieu-music/a2a-smol-adapter"
+Repository = "https://github.com/matthieu-music/a2a-smol-adapter"
+Issues = "https://github.com/matthieu-music/a2a-smol-adapter/issues"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
