@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+import uuid
+
 import httpx
 from smolagents import Tool
+
+logger = logging.getLogger(__name__)
 
 
 class SmolA2ADelegateTool(Tool):
@@ -15,7 +20,6 @@ class SmolA2ADelegateTool(Tool):
     Usage:
         delegate = SmolA2ADelegateTool(
             remote_url="http://remote-agent:5000/",
-            remote_name="math-agent",
         )
         agent = CodeAgent(tools=[delegate], model=model)
         agent.run("Ask the math agent to compute pi to 100 digits")
@@ -41,18 +45,26 @@ class SmolA2ADelegateTool(Tool):
 
     def __init__(
         self,
-        remote_url: str | None = None,
-        remote_name: str | None = None,
+        remote_url: str = "",
         timeout: float = 120.0,
         **kwargs,
     ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be a positive number")
         super().__init__(**kwargs)
         self._default_url = remote_url
-        self._remote_name = remote_name
         self._timeout = timeout
 
-    def forward(self, url: str | None = None, task: str = "") -> str:
-        """Send a task to a remote A2A agent and return the result."""
+    def forward(self, url: str, task: str) -> str:
+        """Send a task to a remote A2A agent and return the result.
+
+        Args:
+            url: The A2A endpoint URL of the remote agent.
+            task: The task description to send to the remote agent.
+
+        Returns:
+            The text result from the remote agent, or an error message.
+        """
         target_url = url or self._default_url
         if not target_url:
             return "Error: No remote URL provided and no default URL configured."
@@ -60,30 +72,10 @@ class SmolA2ADelegateTool(Tool):
         if not task:
             return "Error: No task description provided."
 
-        # Discover the remote agent card
-        card = self._fetch_agent_card(target_url)
-        if card is None:
-            return f"Error: Could not fetch agent card from {target_url}"
-
-        # Send the task via JSON-RPC 2.0
-        result = self._send_task(target_url, task)
-        return result
-
-    def _fetch_agent_card(self, base_url: str) -> dict | None:
-        """Fetch the agent card from the well-known endpoint."""
-        card_url = base_url.rstrip("/") + "/.well-known/agent-card.json"
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.get(card_url)
-                resp.raise_for_status()
-                return resp.json()
-        except (httpx.HTTPError, ValueError):
-            return None
+        return self._send_task(target_url, task)
 
     def _send_task(self, base_url: str, task_text: str) -> str:
         """Send a message/send JSON-RPC request to the remote agent."""
-        import uuid
-
         rpc_url = base_url.rstrip("/") + "/"
         payload = {
             "jsonrpc": "2.0",
@@ -104,12 +96,16 @@ class SmolA2ADelegateTool(Tool):
                 resp.raise_for_status()
                 data = resp.json()
         except (httpx.HTTPError, ValueError) as exc:
+            logger.error("Failed to send task to %s: %s", rpc_url, exc)
             return f"Error communicating with remote agent: {exc}"
 
         return self._extract_result(data)
 
     def _extract_result(self, rpc_response: dict) -> str:
         """Extract text from a JSON-RPC response."""
+        if not rpc_response or not isinstance(rpc_response, dict):
+            return "Error: Received invalid JSON-RPC response"
+
         if "error" in rpc_response:
             error = rpc_response["error"]
             return f"Remote agent error: {error.get('message', str(error))}"

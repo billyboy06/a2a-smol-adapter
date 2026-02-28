@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
-from typing import AsyncGenerator, Union
 
 import uvicorn
 from a2a.server.apps import A2AFastAPIApplication
@@ -17,21 +17,24 @@ from a2a.types import (
     AgentCapabilities,
     AgentSkill,
     Message,
-    Task,
     TaskArtifactUpdateEvent,
     TaskState,
     TaskStatus,
     TaskStatusUpdateEvent,
 )
-from a2a.utils.helpers import new_agent_text_message, new_task
+from a2a.utils.helpers import build_text_artifact
 
 from smolagents import CodeAgent
+
+logger = logging.getLogger(__name__)
 
 
 class SmolAgentExecutor(AgentExecutor):
     """Bridges A2A task execution to a smolagents CodeAgent."""
 
     def __init__(self, agent: CodeAgent) -> None:
+        if not agent:
+            raise ValueError("agent is required")
         self._agent = agent
 
     async def execute(
@@ -40,6 +43,11 @@ class SmolAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
     ) -> None:
         """Run the smolagents CodeAgent with the incoming message text."""
+        if not context.current_task:
+            raise ValueError("RequestContext must have a current_task")
+        if not context.message:
+            raise ValueError("RequestContext must have a message")
+
         task = context.current_task
         user_message = context.message
 
@@ -49,35 +57,45 @@ class SmolAgentExecutor(AgentExecutor):
         # Update status to working
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
-                taskId=task.id,
-                contextId=task.contextId,
-                status=TaskStatus(state=TaskState.working, message=None),
+                task_id=task.id,
+                context_id=task.context_id,
+                status=TaskStatus(state=TaskState.working),
                 final=False,
             )
         )
 
         # Run the smolagents CodeAgent in a thread (it's synchronous)
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, self._agent.run, prompt)
+        try:
+            result = await loop.run_in_executor(None, self._agent.run, prompt)
+        except Exception as exc:
+            logger.error("Agent execution failed for task %s: %s", task.id, exc, exc_info=True)
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=task.id,
+                    context_id=task.context_id,
+                    status=TaskStatus(state=TaskState.failed),
+                    final=True,
+                )
+            )
+            return
 
         # Package the result as an A2A artifact
         result_text = str(result) if result is not None else ""
+        artifact = build_text_artifact(result_text, str(uuid.uuid4()))
         artifact_event = TaskArtifactUpdateEvent(
-            taskId=task.id,
-            contextId=task.contextId,
-            artifact={
-                "artifactId": str(uuid.uuid4()),
-                "parts": [{"kind": "text", "text": result_text}],
-            },
+            task_id=task.id,
+            context_id=task.context_id,
+            artifact=artifact,
         )
         await event_queue.enqueue_event(artifact_event)
 
         # Mark task as completed
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
-                taskId=task.id,
-                contextId=task.contextId,
-                status=TaskStatus(state=TaskState.completed, message=None),
+                task_id=task.id,
+                context_id=task.context_id,
+                status=TaskStatus(state=TaskState.completed),
                 final=True,
             )
         )
@@ -87,24 +105,32 @@ class SmolAgentExecutor(AgentExecutor):
         task = context.current_task
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
-                taskId=task.id,
-                contextId=task.contextId,
-                status=TaskStatus(
-                    state=TaskState.canceled,
-                    message=new_agent_text_message("Task canceled."),
-                ),
+                task_id=task.id,
+                context_id=task.context_id,
+                status=TaskStatus(state=TaskState.canceled),
                 final=True,
             )
         )
 
 
 def _extract_text(message: Message) -> str:
-    """Extract plain text from an A2A Message."""
+    """Extract plain text from an A2A Message.
+
+    Raises:
+        ValueError: If message has no text parts.
+    """
+    if not message or not message.parts:
+        raise ValueError("Message must have at least one part")
+
     parts = []
     for part in message.parts:
         if hasattr(part, "text"):
             parts.append(part.text)
-    return "\n".join(parts) if parts else ""
+
+    if not parts:
+        raise ValueError("Message contains no text parts")
+
+    return "\n".join(parts)
 
 
 class SmolA2AServer:
@@ -130,6 +156,13 @@ class SmolA2AServer:
         port: int = 5000,
         skills: list[dict] | None = None,
     ) -> None:
+        if not agent:
+            raise ValueError("agent is required")
+        if not name:
+            raise ValueError("name is required")
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            raise ValueError("port must be an integer between 1 and 65535")
+
         self._agent = agent
         self._host = host
         self._port = port
@@ -150,10 +183,10 @@ class SmolA2AServer:
             description=description,
             version=version,
             url=f"http://{host}:{port}/",
-            capabilities=AgentCapabilities(streaming=True),
+            capabilities=AgentCapabilities(streaming=False),
             skills=[AgentSkill(**s) for s in default_skills],
-            defaultInputModes=["text/plain"],
-            defaultOutputModes=["text/plain"],
+            default_input_modes=["text/plain"],
+            default_output_modes=["text/plain"],
         )
 
         # Build the A2A server stack
