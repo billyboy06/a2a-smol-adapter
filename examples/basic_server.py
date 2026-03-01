@@ -1,5 +1,7 @@
 """Example: Expose a smolagents CodeAgent as an A2A server."""
 
+import os
+
 from smolagents import CodeAgent, InferenceClientModel
 
 from a2a_smol_adapter import SmolA2AServer
@@ -14,6 +16,8 @@ server = SmolA2AServer(
     name="smol-code-agent",
     description="A general-purpose code agent exposed via A2A",
     port=5001,
+    api_key=os.environ.get("A2A_API_KEY"),  # optional: set env var to protect with Bearer token
+    agent_timeout=60.0,  # optional: timeout after 60s (default: 120s)
     skills=[
         {
             "id": "code-gen",
@@ -30,6 +34,7 @@ server = SmolA2AServer(
 
 if __name__ == "__main__":
     print(f"Starting A2A server: {server.agent_card.name}")
-    print(f"Agent Card: http://localhost:5001/.well-known/agent-card.json")
-    print(f"JSON-RPC endpoint: http://localhost:5001/")
+    print("Agent Card: http://localhost:5001/.well-known/agent-card.json")
+    print("Health:     http://localhost:5001/health")
+    print("JSON-RPC:   http://localhost:5001/")
     server.run()

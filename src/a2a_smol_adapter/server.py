@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import uuid
 
@@ -47,7 +48,9 @@ class _ApiKeyMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         auth_header = request.headers.get("authorization", "")
-        if not auth_header.startswith("Bearer ") or auth_header[7:] != self._api_key:
+        if not auth_header.startswith("Bearer ") or not hmac.compare_digest(
+            auth_header[7:], self._api_key
+        ):
             return JSONResponse(
                 status_code=401,
                 content={
@@ -252,7 +255,9 @@ def _extract_text(message: Message) -> str:
     """
     if not message or not message.parts:
         raise ValueError("Message must have at least one part")
+    _MAX_PROMPT_SIZE = 100_000  # 100KB limit to prevent abuse
     texts: list[str] = []
+    total_size = 0
     for part in message.parts:
         text = None
         # Direct .text attribute (plain objects, mocks)
@@ -262,6 +267,11 @@ def _extract_text(message: Message) -> str:
         elif hasattr(part, "root") and hasattr(part.root, "text"):
             text = str(part.root.text)
         if text is not None:
+            total_size += len(text)
+            if total_size > _MAX_PROMPT_SIZE:
+                raise ValueError(
+                    f"Message text exceeds maximum size of {_MAX_PROMPT_SIZE} characters"
+                )
             texts.append(text)
     if not texts:
         raise ValueError("Message contains no text parts")
@@ -278,7 +288,7 @@ class SmolA2AServer:
         name: str = "smol-agent",
         description: str = "A smolagents CodeAgent exposed via A2A protocol",
         version: str = "0.1.0",
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 5000,
         skills: list[dict] | None = None,
         api_key: str | None = None,

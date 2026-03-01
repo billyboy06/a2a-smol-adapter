@@ -37,6 +37,14 @@ class TestExtractText:
         with pytest.raises(ValueError, match="at least one part"):
             _extract_text(None)
 
+    def test_oversized_message_raises(self):
+        msg = MagicMock()
+        part = MagicMock()
+        part.text = "x" * 200_000  # exceeds 100KB limit
+        msg.parts = [part]
+        with pytest.raises(ValueError, match="exceeds maximum size"):
+            _extract_text(msg)
+
 
 class TestSmolA2AServer:
     def test_creates_with_defaults(self):
