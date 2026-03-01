@@ -23,90 +23,221 @@ from a2a.types import (
     TaskStatusUpdateEvent,
 )
 from a2a.utils.helpers import build_text_artifact
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from smolagents import CodeAgent
 
 logger = logging.getLogger(__name__)
 
+# Paths excluded from API key auth
+_AUTH_EXEMPT_PATHS = {"/.well-known/agent-card.json", "/health"}
+
+
+class _ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Validates Bearer token on all requests except exempt paths."""
+
+    def __init__(self, app, api_key: str) -> None:
+        super().__init__(app)
+        self._api_key = api_key
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer ") or auth_header[7:] != self._api_key:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32001,
+                        "message": "Unauthorized: invalid or missing API key",
+                    },
+                },
+            )
+        return await call_next(request)
+
 
 class SmolAgentExecutor(AgentExecutor):
     """Bridges A2A task execution to a smolagents CodeAgent."""
 
-    def __init__(self, agent: CodeAgent) -> None:
+    def __init__(self, agent: CodeAgent, *, agent_timeout: float = 120.0) -> None:
         if not agent:
             raise ValueError("agent is required")
+        if agent_timeout <= 0:
+            raise ValueError("agent_timeout must be a positive number")
         self._agent = agent
+        self._agent_timeout = agent_timeout
 
-    async def execute(
-        self,
-        context: RequestContext,
-        event_queue: EventQueue,
-    ) -> None:
-        """Run the smolagents CodeAgent with the incoming message text."""
-        if not context.current_task:
-            raise ValueError("RequestContext must have a current_task")
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         if not context.message:
             raise ValueError("RequestContext must have a message")
 
-        task = context.current_task
-        user_message = context.message
+        task_id = context.task_id
+        context_id = context.context_id
+        prompt = _extract_text(context.message)
 
-        # Extract text from the incoming A2A message
-        prompt = _extract_text(user_message)
-
-        # Update status to working
+        # Emit: working
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
-                task_id=task.id,
-                context_id=task.context_id,
+                task_id=task_id,
+                context_id=context_id,
                 status=TaskStatus(state=TaskState.working),
                 final=False,
             )
         )
 
-        # Run the smolagents CodeAgent in a thread (it's synchronous)
+        # Run agent synchronously in executor with timeout
         loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(None, self._agent.run, prompt)
-        except Exception as exc:
-            logger.error("Agent execution failed for task %s: %s", task.id, exc, exc_info=True)
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, self._agent.run, prompt),
+                timeout=self._agent_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Agent execution timed out for task %s after %ss",
+                task_id,
+                self._agent_timeout,
+            )
             await event_queue.enqueue_event(
                 TaskStatusUpdateEvent(
-                    task_id=task.id,
-                    context_id=task.context_id,
+                    task_id=task_id,
+                    context_id=context_id,
+                    status=TaskStatus(state=TaskState.failed),
+                    final=True,
+                )
+            )
+            return
+        except Exception as exc:
+            logger.error("Agent execution failed for task %s: %s", task_id, exc, exc_info=True)
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=task_id,
+                    context_id=context_id,
                     status=TaskStatus(state=TaskState.failed),
                     final=True,
                 )
             )
             return
 
-        # Package the result as an A2A artifact
+        # Emit: artifact
         result_text = str(result) if result is not None else ""
         artifact = build_text_artifact(result_text, str(uuid.uuid4()))
-        artifact_event = TaskArtifactUpdateEvent(
-            task_id=task.id,
-            context_id=task.context_id,
-            artifact=artifact,
+        await event_queue.enqueue_event(
+            TaskArtifactUpdateEvent(task_id=task_id, context_id=context_id, artifact=artifact)
         )
-        await event_queue.enqueue_event(artifact_event)
 
-        # Mark task as completed
+        # Emit: completed
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
-                task_id=task.id,
-                context_id=task.context_id,
+                task_id=task_id,
+                context_id=context_id,
+                status=TaskStatus(state=TaskState.completed),
+                final=True,
+            )
+        )
+
+    async def execute_streaming(self, context: RequestContext, event_queue: EventQueue) -> None:
+        """Execute with streaming — emits intermediate working events from agent steps."""
+        if not context.message:
+            raise ValueError("RequestContext must have a message")
+
+        task_id = context.task_id
+        context_id = context.context_id
+        prompt = _extract_text(context.message)
+
+        # Emit: working
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=task_id,
+                context_id=context_id,
+                status=TaskStatus(state=TaskState.working),
+                final=False,
+            )
+        )
+
+        def _run_streaming() -> tuple[list[str], str]:
+            """Run agent.run(stream=True) in a thread, collecting steps."""
+            steps: list[str] = []
+            final_result = None
+            for step in self._agent.run(prompt, stream=True):
+                step_text = str(step) if step is not None else ""
+                if step_text:
+                    steps.append(step_text)
+                final_result = step
+            result = str(final_result) if final_result is not None else ""
+            return steps, result
+
+        loop = asyncio.get_running_loop()
+        try:
+            steps, result_text = await asyncio.wait_for(
+                loop.run_in_executor(None, _run_streaming),
+                timeout=self._agent_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Agent streaming timed out for task %s after %ss",
+                task_id,
+                self._agent_timeout,
+            )
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=task_id,
+                    context_id=context_id,
+                    status=TaskStatus(state=TaskState.failed),
+                    final=True,
+                )
+            )
+            return
+        except Exception as exc:
+            logger.error("Agent streaming failed for task %s: %s", task_id, exc, exc_info=True)
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=task_id,
+                    context_id=context_id,
+                    status=TaskStatus(state=TaskState.failed),
+                    final=True,
+                )
+            )
+            return
+
+        # Emit intermediate working events for each step
+        for step_text in steps:
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=task_id,
+                    context_id=context_id,
+                    status=TaskStatus(state=TaskState.working),
+                    final=False,
+                )
+            )
+
+        # Emit: artifact
+        artifact = build_text_artifact(result_text, str(uuid.uuid4()))
+        await event_queue.enqueue_event(
+            TaskArtifactUpdateEvent(task_id=task_id, context_id=context_id, artifact=artifact)
+        )
+
+        # Emit: completed
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=task_id,
+                context_id=context_id,
                 status=TaskStatus(state=TaskState.completed),
                 final=True,
             )
         )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        """Cancel is not supported for smolagents CodeAgent."""
-        task = context.current_task
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
-                task_id=task.id,
-                context_id=task.context_id,
+                task_id=context.task_id,
+                context_id=context.context_id,
                 status=TaskStatus(state=TaskState.canceled),
                 final=True,
             )
@@ -114,36 +245,31 @@ class SmolAgentExecutor(AgentExecutor):
 
 
 def _extract_text(message: Message) -> str:
-    """Extract plain text from an A2A Message.
+    """Extract text content from an A2A Message.
 
-    Raises:
-        ValueError: If message has no text parts.
+    Handles both SDK Part wrapper objects (Part.root.text) and plain objects
+    with a direct .text attribute (e.g., mocks in tests).
     """
     if not message or not message.parts:
         raise ValueError("Message must have at least one part")
-
-    parts = []
+    texts: list[str] = []
     for part in message.parts:
-        if hasattr(part, "text"):
-            parts.append(part.text)
-
-    if not parts:
+        text = None
+        # Direct .text attribute (plain objects, mocks)
+        if hasattr(part, "text") and isinstance(getattr(part, "text", None), str):
+            text = part.text
+        # SDK Part wrapper: actual part is in .root
+        elif hasattr(part, "root") and hasattr(part.root, "text"):
+            text = str(part.root.text)
+        if text is not None:
+            texts.append(text)
+    if not texts:
         raise ValueError("Message contains no text parts")
-
-    return "\n".join(parts)
+    return "\n".join(texts)
 
 
 class SmolA2AServer:
-    """A2A-compliant server wrapping a smolagents CodeAgent.
-
-    Usage:
-        from smolagents import CodeAgent, InferenceClientModel
-        from a2a_smol_adapter import SmolA2AServer
-
-        agent = CodeAgent(tools=[], model=InferenceClientModel())
-        server = SmolA2AServer(agent, name="my-smol-agent", port=5000)
-        server.run()
-    """
+    """A2A-compliant server wrapping a smolagents CodeAgent."""
 
     def __init__(
         self,
@@ -155,6 +281,8 @@ class SmolA2AServer:
         host: str = "0.0.0.0",
         port: int = 5000,
         skills: list[dict] | None = None,
+        api_key: str | None = None,
+        agent_timeout: float = 120.0,
     ) -> None:
         if not agent:
             raise ValueError("agent is required")
@@ -166,8 +294,9 @@ class SmolA2AServer:
         self._agent = agent
         self._host = host
         self._port = port
+        self._api_key = api_key
+        self._version = version
 
-        # Build the AgentCard
         default_skills = skills or [
             {
                 "id": "general",
@@ -183,14 +312,13 @@ class SmolA2AServer:
             description=description,
             version=version,
             url=f"http://{host}:{port}/",
-            capabilities=AgentCapabilities(streaming=False),
+            capabilities=AgentCapabilities(streaming=True),
             skills=[AgentSkill(**s) for s in default_skills],
             default_input_modes=["text/plain"],
             default_output_modes=["text/plain"],
         )
 
-        # Build the A2A server stack
-        self._executor = SmolAgentExecutor(agent)
+        self._executor = SmolAgentExecutor(agent, agent_timeout=agent_timeout)
         self._task_store = InMemoryTaskStore()
         self._handler = DefaultRequestHandler(
             agent_executor=self._executor,
@@ -206,10 +334,22 @@ class SmolA2AServer:
         return self._agent_card
 
     def build_app(self):
-        """Build and return the FastAPI app (for testing or custom deployment)."""
-        return self._app_builder.build(title=f"A2A: {self._agent_card.name}")
+        """Build the FastAPI app with auth middleware and health endpoint."""
+        app = self._app_builder.build(title=f"A2A: {self._agent_card.name}")
+
+        @app.get("/health")
+        async def health():
+            return {
+                "status": "ok",
+                "agent": self._agent_card.name,
+                "version": self._version,
+            }
+
+        if self._api_key:
+            app.add_middleware(_ApiKeyMiddleware, api_key=self._api_key)
+
+        return app
 
     def run(self) -> None:
-        """Start the server with uvicorn."""
         app = self.build_app()
         uvicorn.run(app, host=self._host, port=self._port)

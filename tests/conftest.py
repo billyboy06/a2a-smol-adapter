@@ -29,9 +29,11 @@ def mock_task():
 
 @pytest.fixture
 def mock_context(mock_task):
-    """A mocked RequestContext with a current_task and a single text message."""
+    """A mocked RequestContext with task_id, context_id, and a single text message."""
     ctx = MagicMock(spec=RequestContext)
     ctx.current_task = mock_task
+    ctx.task_id = mock_task.id
+    ctx.context_id = mock_task.context_id
 
     part = MagicMock()
     part.text = "Hello agent"
