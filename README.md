@@ -1,9 +1,9 @@
 # A2A-Smol-Adapter
 
+[![CI](https://github.com/billyboy06/a2a-smol-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/billyboy06/a2a-smol-adapter/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/a2a-smol-adapter)](https://pypi.org/project/a2a-smol-adapter/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-69%20passed-brightgreen.svg)](#testing)
-[![Ruff](https://img.shields.io/badge/linter-ruff-orange.svg)](https://docs.astral.sh/ruff/)
 
 Bridge between [smolagents](https://github.com/huggingface/smolagents) (HuggingFace) and the [A2A protocol](https://github.com/google/A2A) (Google).
 
